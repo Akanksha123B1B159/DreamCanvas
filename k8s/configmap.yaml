@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dreamcanvas-config
+  namespace: dreamcanvas
+data:
+  NODE_ENV: "production"
+  PORT: "3000"
+  REDIS_URL: "redis://redis-service.dreamcanvas.svc.cluster.local:6379"
+  JOB_DETECTION_URL: "http://ml-service.dreamcanvas.svc.cluster.local:8000"
+  NEXT_PUBLIC_APP_URL: "http://dreamcanvas.local"
+  GROQ_MODEL: "qwen/qwen3.6-27b"
+  HEARTBEAT_INTERVAL: "10"
+  HEARTBEAT_TIMEOUT: "4"
+  HEARTBEAT_FAILURE_THRESHOLD: "2"
+  WORKER_HEARTBEAT_KEY: "dreamcanvas:health:worker"

@@ -14,6 +14,9 @@ services:
       REDIS_URL: redis://redis:6379
       JOB_DETECTION_URL: http://job-detection:8000
       NEXT_PUBLIC_APP_URL: http://localhost:3000
+      HEARTBEAT_INTERVAL: ${HEARTBEAT_INTERVAL:-10}
+      HEARTBEAT_TIMEOUT: ${HEARTBEAT_TIMEOUT:-4}
+      HEARTBEAT_FAILURE_THRESHOLD: ${HEARTBEAT_FAILURE_THRESHOLD:-2}
     depends_on:
       redis:
         condition: service_healthy
@@ -33,6 +36,8 @@ services:
     environment:
       REDIS_URL: redis://redis:6379
       FRONTEND_URL: http://frontend:3000
+      HEARTBEAT_INTERVAL: ${HEARTBEAT_INTERVAL:-10}
+      WORKER_HEARTBEAT_KEY: ${WORKER_HEARTBEAT_KEY:-dreamcanvas:health:worker}
     depends_on:
       redis:
         condition: service_healthy

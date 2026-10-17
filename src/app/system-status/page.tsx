@@ -1,4 +1,5 @@
-'use client';
-import { useEffect, useState } from 'react';
+import { redirect } from 'next/navigation';
 
-export default function SystemStatusPage() { const [status, setStatus] = useState<Record<string, string>>({}); useEffect(() => { fetch('/api/system-status').then((response) => response.json()).then(setStatus); }, []); return <main className="min-h-screen bg-[#0d1117] px-6 py-10 text-white"><div className="mx-auto max-w-3xl"><p className="text-sm uppercase tracking-[0.25em] text-emerald-400">Operations</p><h1 className="mt-3 text-4xl font-bold">System status</h1><div className="mt-8 divide-y divide-slate-800 rounded-xl border border-slate-800">{Object.entries(status).map(([name, state]) => <div key={name} className="flex items-center justify-between px-5 py-4"><span className="capitalize">{name.replace('-', ' ')}</span><span className={state === 'OFFLINE' || state === 'UNAVAILABLE' ? 'text-amber-400' : 'text-emerald-400'}>{state}</span></div>)}</div></div></main>; }
+export default function SystemStatusPage() {
+  redirect('/system-health');
+}

@@ -1,0 +1,49 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend-deployment
+  namespace: dreamcanvas
+  labels:
+    app: dreamcanvas-frontend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: dreamcanvas-frontend
+  template:
+    metadata:
+      labels:
+        app: dreamcanvas-frontend
+    spec:
+      containers:
+        - name: frontend
+          image: dreamcanvas-frontend:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 3000
+          envFrom:
+            - configMapRef:
+                name: dreamcanvas-config
+            - secretRef:
+                name: dreamcanvas-secrets
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"
+          readinessProbe:
+            httpGet:
+              path: /api/services
+              port: 3000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 3000
+            initialDelaySeconds: 20
+            periodSeconds: 15
+            timeoutSeconds: 5

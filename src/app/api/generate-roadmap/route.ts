@@ -1,16 +1,15 @@
-// NextRequest - handles incoming requests in Next.js API routes
-// NextResponse - used to send responses back to the client
-import { NextRequest, NextResponse } from "next/server";
-// jsonrepair - library to repair malformed JSON strings
-import { jsonrepair } from "jsonrepair";
-import { groqModel } from '@/app/_libs/distributed';
+import { randomUUID } from 'crypto';
+import { NextRequest, NextResponse } from 'next/server';
+import { jsonrepair } from 'jsonrepair';
+import {
+  getEvents,
+  groqModel,
+  recordPropagatedWorkflowEvent,
+  recordWorkflowEvent,
+} from '@/app/_libs/distributed';
 
-// load environment variables from .env file (make sure it's also set in Vercel dashboard)
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
-// Groq API endpoint for chat completions
-const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
-// MODEL - the specific model to use for the API request
-const MODEL = groqModel;
+const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
 
 function parseRoadmapResponse(content: unknown) {
   if (typeof content !== 'string' || !content.trim()) {
@@ -31,24 +30,92 @@ function parseRoadmapResponse(content: unknown) {
   return JSON.parse(jsonrepair(candidate.slice(start, end + 1)));
 }
 
-// Ensure Node.js runtime (not Edge, since axios/fetch in Edge may behave differently)
-export const runtime = "nodejs";
+export const runtime = 'nodejs';
 
-// post function - handles POST requests to the API route
+function workflowResponse(
+  correlationId: string,
+  body: Record<string, unknown>,
+  statusCode: number,
+  eventStatus: 'SUCCESS' | 'FAILED',
+) {
+  const sent = recordWorkflowEvent({
+    service: 'frontend',
+    eventName: 'LEARNING_PLAN_RESPONSE_SENT',
+    processName: 'dreamcanvas-api',
+    correlationId,
+    eventType: 'send',
+    status: eventStatus,
+  });
+  const response = NextResponse.json({
+    ...body,
+    correlationId,
+    logicalTimestamp: sent.logicalTimestamp,
+    events: getEvents().filter((event) => event.correlationId === correlationId),
+  }, { status: statusCode });
+  response.headers.set('x-correlation-id', correlationId);
+  response.headers.set('x-lamport-timestamp', String(sent.logicalTimestamp));
+  return response;
+}
+
 export async function POST(req: NextRequest) {
+  const correlationId = req.headers.get('x-correlation-id') || randomUUID();
+  const incomingText = req.headers.get('x-lamport-timestamp');
+  const parsedTimestamp = incomingText && /^\d+$/.test(incomingText) ? Number(incomingText) : undefined;
+  const incomingTimestamp = parsedTimestamp !== undefined && Number.isSafeInteger(parsedTimestamp)
+    ? parsedTimestamp
+    : undefined;
+
+  if (incomingTimestamp !== undefined) {
+    const sourceProcess = req.headers.get('x-lamport-process') === 'roadmap-worker'
+      ? 'roadmap-worker'
+      : 'dreamcanvas-browser';
+    recordPropagatedWorkflowEvent({
+      service: 'frontend',
+      eventName: req.headers.get('x-lamport-event') === 'LEARNING_PLAN_REQUESTED'
+        ? 'LEARNING_PLAN_REQUESTED'
+        : 'LEARNING_PLAN_REQUEST_SENT',
+      processName: sourceProcess,
+      correlationId,
+      logicalTimestamp: incomingTimestamp,
+      status: 'SUCCESS',
+    });
+  }
+
+  recordWorkflowEvent({
+    service: 'frontend',
+    eventName: 'REQUEST_RECEIVED',
+    processName: 'dreamcanvas-api',
+    correlationId,
+    eventType: 'receive',
+    receivedTimestamp: incomingTimestamp,
+  });
+
   try {
-    // takes the request body
-    const body = await req.json();
-    const { skills, role } = body;
+    const body = await req.json().catch(() => null);
+    const skills = body && typeof body.skills === 'string' ? body.skills.trim() : '';
+    const role = body && typeof body.role === 'string' ? body.role.trim() : '';
 
     if (!skills || !role) {
-      return NextResponse.json(
-        { error: "Missing fields: skills or role" },
-        { status: 400 }
-      );
+      recordWorkflowEvent({
+        service: 'frontend',
+        eventName: 'LEARNING_PLAN_FAILED',
+        processName: 'dreamcanvas-api',
+        correlationId,
+        eventType: 'local',
+        status: 'FAILED',
+        error: 'Missing fields: skills or role',
+      });
+      return workflowResponse(correlationId, { error: 'Missing fields: skills or role' }, 400, 'FAILED');
     }
 
-    // prompt - the message sent to the LLaMA model to generate a personalized learning roadmap
+    recordWorkflowEvent({
+      service: 'frontend',
+      eventName: 'AI_ANALYSIS_STARTED',
+      processName: 'dreamcanvas-api',
+      correlationId,
+      eventType: 'local',
+    });
+
     const prompt = `
 You are a helpful career assistant.
 
@@ -73,76 +140,110 @@ Respond ONLY in JSON using this format:
 Do not include markdown or explanations.
 `;
 
-    // response - sends a POST request to the LLaMA API with the prompt and model details
+    const aiRequestSent = recordWorkflowEvent({
+      service: 'groq',
+      eventName: 'AI_REQUEST_SENT',
+      processName: 'dreamcanvas-api',
+      correlationId,
+      eventType: 'send',
+      status: 'SUCCESS',
+    });
+
     const response = await fetch(GROQ_URL, {
-      method: "POST",
+      method: 'POST',
       headers: {
         Authorization: `Bearer ${GROQ_API_KEY}`,
-        "Content-Type": "application/json",
+        'Content-Type': 'application/json',
+        'x-correlation-id': correlationId,
+        'x-lamport-timestamp': String(aiRequestSent.logicalTimestamp),
       },
       body: JSON.stringify({
-        model: MODEL,
-        messages: [{ role: "user", content: prompt }],
+        model: groqModel,
+        messages: [{ role: 'user', content: prompt }],
         temperature: 0.2,
         max_tokens: 6000,
       }),
     });
 
-    // check if API request succeeded
     if (!response.ok) {
-      const errorText = await response.text();
-      console.error("❌ Groq API Error:", response.status, errorText);
-      return NextResponse.json(
-        { error: "Groq API request failed", detail: errorText },
-        { status: response.status }
+      const errorText = await response.text().catch(() => '');
+      recordWorkflowEvent({
+        service: 'groq',
+        eventName: 'LEARNING_PLAN_FAILED',
+        processName: 'dreamcanvas-api',
+        correlationId,
+        eventType: 'receive',
+        receivedTimestamp: aiRequestSent.logicalTimestamp,
+        status: 'FAILED',
+        error: `Groq API request failed with HTTP ${response.status}`,
+      });
+      console.error('❌ Groq API Error:', response.status, errorText);
+      return workflowResponse(
+        correlationId,
+        { error: 'Groq API request failed', detail: errorText },
+        response.status,
+        'FAILED',
       );
     }
 
-    // parse the response
     const data = await response.json();
     const content = data.choices?.[0]?.message?.content;
-    console.log("🧠 Raw LLaMA Response:", content);
+    let result: { missingSkills?: unknown; roadmap?: unknown };
 
-    let json;
     try {
-      // Strip potential markdown code fences or extra noise
-      // This regex captures JSON content within code blocks or directly
-      // It handles both fenced code blocks (```json) and plain JSON
-      json = parseRoadmapResponse(content);
-
-    } catch (parseErr) {
-      console.error("❌ JSON parsing failed:", parseErr);
-      return NextResponse.json(
-        { error: "Invalid JSON format in LLM response" },
-        { status: 500 }
-      );
+      result = parseRoadmapResponse(content);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : 'Invalid response from the AI service.';
+      recordWorkflowEvent({
+        service: 'groq',
+        eventName: 'LEARNING_PLAN_FAILED',
+        processName: 'dreamcanvas-api',
+        correlationId,
+        eventType: 'receive',
+        receivedTimestamp: aiRequestSent.logicalTimestamp,
+        status: 'FAILED',
+        error: detail,
+      });
+      console.error('❌ JSON parsing failed:', error);
+      return workflowResponse(correlationId, { error: 'Invalid JSON format in LLM response' }, 500, 'FAILED');
     }
 
-    // Validate the structure of the JSON response
-    if (!json.roadmap || !Array.isArray(json.roadmap)) {
-      return NextResponse.json(
-        { error: "Response missing valid roadmap array" },
-        { status: 500 }
-      );
+    if (!Array.isArray(result.roadmap)) {
+      recordWorkflowEvent({
+        service: 'groq',
+        eventName: 'LEARNING_PLAN_FAILED',
+        processName: 'dreamcanvas-api',
+        correlationId,
+        eventType: 'receive',
+        receivedTimestamp: aiRequestSent.logicalTimestamp,
+        status: 'FAILED',
+        error: 'Response missing valid roadmap array',
+      });
+      return workflowResponse(correlationId, { error: 'Response missing valid roadmap array' }, 500, 'FAILED');
     }
 
-    // return final response
-    return NextResponse.json(json);
-  } catch (err: unknown) {
-  // catch and log any unexpected errors
-  if (err instanceof Error) {
-    console.error("❌ API error:", err.message);
-    return NextResponse.json(
-      { error: "Failed to fetch roadmap from LLaMA 3", detail: err.message },
-      { status: 500 }
-    );
+    recordWorkflowEvent({
+      service: 'groq',
+      eventName: 'AI_ANALYSIS_COMPLETED',
+      processName: 'dreamcanvas-api',
+      correlationId,
+      eventType: 'receive',
+      receivedTimestamp: aiRequestSent.logicalTimestamp,
+      status: 'SUCCESS',
+    });
+    return workflowResponse(correlationId, result, 200, 'SUCCESS');
+  } catch (error: unknown) {
+    const detail = error instanceof Error ? error.message : 'Unknown error';
+    recordWorkflowEvent({
+      service: 'frontend',
+      eventName: 'LEARNING_PLAN_FAILED',
+      processName: 'dreamcanvas-api',
+      correlationId,
+      eventType: 'local',
+      status: 'FAILED',
+      error: detail,
+    });
+    console.error('❌ API error:', detail);
+    return workflowResponse(correlationId, { error: 'Failed to fetch roadmap from LLaMA 3', detail }, 500, 'FAILED');
   }
-
-  console.error("❌ Unknown API error:", err);
-  return NextResponse.json(
-    { error: "Failed to fetch roadmap from LLaMA 3", detail: "Unknown error" },
-    { status: 500 }
-  );
 }
-}
-

@@ -5,6 +5,14 @@ import { useRouter } from 'next/navigation';
 import Swal from 'sweetalert2';
 import { motion } from 'framer-motion';
 import { Mail, Lock, User, Sparkles, ArrowRight, UserPlus } from 'lucide-react';
+import {
+  getPasswordStrength,
+  isValidRegistrationEmail,
+  isValidRegistrationName,
+  isValidRegistrationPassword,
+  MAX_EMAIL_LENGTH,
+  MAX_FULL_NAME_LENGTH,
+} from '@/app/_libs/registrationPolicy';
 
 export default function RegisterPage() {
   const [email, setEmail] = useState('');
@@ -12,40 +20,71 @@ export default function RegisterPage() {
   const [fullName, setFullName] = useState('');
   const [loading, setLoading] = useState(false);
   const router = useRouter();
+  const passwordStrength = getPasswordStrength(password);
 
   const handleRegister = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (loading) return;
+
+    const normalizedEmail = email.trim().toLowerCase();
+    const normalizedFullName = fullName.trim();
+
+    if (!isValidRegistrationName(normalizedFullName)) {
+      Swal.fire({
+        title: 'Check your details',
+        text: 'Please enter a name between 1 and 100 characters.',
+        icon: 'warning',
+        position: 'top',
+      });
+      return;
+    }
+    if (!isValidRegistrationEmail(normalizedEmail)) {
+      Swal.fire({
+        title: 'Check your details',
+        text: 'Please enter a valid email address.',
+        icon: 'warning',
+        position: 'top',
+      });
+      return;
+    }
+    if (!isValidRegistrationPassword(password)) {
+      Swal.fire({
+        title: 'Choose a stronger password',
+        text: 'Your password must be at least 12 characters long.',
+        icon: 'warning',
+        position: 'top',
+      });
+      return;
+    }
+
     setLoading(true);
 
     try {
       const res = await fetch('/api/auth/register', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: email.trim(), password, full_name: fullName.trim() }),
+        body: JSON.stringify({ email: normalizedEmail, password, full_name: normalizedFullName }),
       });
 
       const data = await res.json().catch(() => ({}));
-      setLoading(false);
 
       if (res.ok) {
         Swal.fire({
-          title: 'Registration successful!',
-          text: data.profileWarning || (data.user?.identities?.length === 0
-            ? 'This email already has an account. Try logging in instead.'
-            : 'Check your email to confirm your account if confirmation is enabled, then log in.'),
+          title: 'Registration request received',
+          text: 'If registration can proceed for this email, check your inbox for next steps. You can log in once your account is ready.',
           icon: 'success',
           position: 'top',
         });
-        if (data.user?.identities?.length !== 0) router.push('/login');
+        router.push('/login');
       } else {
         Swal.fire({
           title: 'Oops,',
-          text: data.error || `Registration failed (HTTP ${res.status}). Please try again.`,
+          text: data.error || 'Registration could not be completed. Please try again later.',
           icon: 'error',
           position: 'top',
         });
       }
-    } catch (err) {
+    } catch {
       setLoading(false);
       Swal.fire({
         title: 'Oops,',
@@ -53,7 +92,9 @@ export default function RegisterPage() {
         icon: 'error',
         position: 'top',
       });
-      console.error('Register error:', err);
+      console.error('Could not connect to the registration service.');
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -118,6 +159,8 @@ export default function RegisterPage() {
                   value={fullName}
                   onChange={(e) => setFullName(e.target.value)}
                   required
+                  maxLength={MAX_FULL_NAME_LENGTH}
+                  disabled={loading}
                   placeholder="John Doe"
                   className="w-full pl-12 pr-4 py-3.5 bg-slate-900/80 border border-slate-700 rounded-xl text-white placeholder-slate-500 focus:outline-none focus:border-emerald-500/50 focus:ring-2 focus:ring-emerald-500/20 transition-all duration-200"
                 />
@@ -143,6 +186,8 @@ export default function RegisterPage() {
                   value={email}
                   onChange={(e) => setEmail(e.target.value)}
                   required
+                  maxLength={MAX_EMAIL_LENGTH}
+                  disabled={loading}
                   placeholder="you@example.com"
                   className="w-full pl-12 pr-4 py-3.5 bg-slate-900/80 border border-slate-700 rounded-xl text-white placeholder-slate-500 focus:outline-none focus:border-emerald-500/50 focus:ring-2 focus:ring-emerald-500/20 transition-all duration-200"
                 />
@@ -168,13 +213,59 @@ export default function RegisterPage() {
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
                   required
+                  disabled={loading}
                   placeholder="••••••••"
                   className="w-full pl-12 pr-4 py-3.5 bg-slate-900/80 border border-slate-700 rounded-xl text-white placeholder-slate-500 focus:outline-none focus:border-emerald-500/50 focus:ring-2 focus:ring-emerald-500/20 transition-all duration-200"
                 />
               </div>
-              <p className="text-xs text-slate-500 mt-1">
-                Must be at least 8 characters
-              </p>
+              <div className="mt-2 space-y-2" aria-live="polite">
+                <div className="flex items-center justify-between text-xs">
+                  <span className="text-slate-400">Password strength</span>
+                  <span className={`font-medium ${
+                    passwordStrength === 'strong'
+                      ? 'text-emerald-400'
+                      : passwordStrength === 'medium'
+                        ? 'text-cyan-400'
+                        : passwordStrength === 'weak'
+                          ? 'text-amber-400'
+                          : 'text-slate-500'
+                  }`}>
+                    {passwordStrength === 'empty'
+                      ? 'Not entered'
+                      : `${passwordStrength[0].toUpperCase()}${passwordStrength.slice(1)}`}
+                  </span>
+                </div>
+                <div
+                  role="meter"
+                  aria-label="Password strength"
+                  aria-valuemin={0}
+                  aria-valuemax={3}
+                  aria-valuenow={
+                    passwordStrength === 'strong' ? 3 : passwordStrength === 'medium' ? 2 : passwordStrength === 'weak' ? 1 : 0
+                  }
+                  className="flex gap-2"
+                >
+                  {['weak', 'medium', 'strong'].map((level, index) => {
+                    const strengthValue = passwordStrength === 'strong' ? 3 : passwordStrength === 'medium' ? 2 : passwordStrength === 'weak' ? 1 : 0;
+                    const isActive = strengthValue > index;
+                    const color = passwordStrength === 'strong'
+                      ? 'bg-emerald-400'
+                      : passwordStrength === 'medium'
+                        ? 'bg-cyan-400'
+                        : 'bg-amber-400';
+
+                    return (
+                      <div
+                        key={level}
+                        className={`h-1.5 flex-1 rounded-full transition-colors ${isActive ? color : 'bg-slate-700'}`}
+                      />
+                    );
+                  })}
+                </div>
+                <p className="text-xs text-slate-500">
+                  Use at least 12 characters. A password of 16 or more characters with a mix of letters, numbers, and symbols is stronger.
+                </p>
+              </div>
             </div>
 
             {/* Submit Button */}
@@ -182,7 +273,7 @@ export default function RegisterPage() {
               whileHover={{ scale: 1.02 }}
               whileTap={{ scale: 0.98 }}
               type="submit"
-              disabled={loading}
+              disabled={loading || !isValidRegistrationPassword(password)}
               className="w-full relative group overflow-hidden bg-gradient-to-r from-emerald-600 to-cyan-600 hover:from-emerald-500 hover:to-cyan-500 text-white font-semibold px-6 py-3.5 rounded-xl transition-all duration-300 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-3 shadow-lg shadow-emerald-500/20 mt-8"
             >
               <div className="absolute inset-0 bg-gradient-to-r from-emerald-400 to-cyan-400 opacity-0 group-hover:opacity-20 transition-opacity duration-300"></div>

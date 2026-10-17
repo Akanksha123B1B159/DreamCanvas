@@ -1,5 +1,6 @@
 import Redis from 'ioredis';
 import { randomUUID } from 'crypto';
+import { LamportLogicalClock } from '@/services/synchronization/lamportLogicalClock';
 
 export type ServiceName = 'frontend' | 'job-detection' | 'redis' | 'database' | 'signaling' | 'groq' | 'youtube';
 
@@ -8,6 +9,8 @@ export type QueueMessage<T = unknown> = {
   type: 'GENERATE_ROADMAP' | 'ANALYZE_JOB' | 'UPDATE_PROGRESS' | 'FETCH_RESOURCES';
   userId: string;
   timestamp: string;
+  correlationId?: string;
+  lamportTimestamp?: number;
   payload: T;
 };
 
@@ -17,6 +20,25 @@ export type DistributedEvent = {
   type: string;
   timestamp: string;
   logicalClock: number;
+  logicalTimestamp: number;
+  processName: string;
+  eventType: 'local' | 'send' | 'receive';
+  correlationId?: string;
+  status?: 'SUCCESS' | 'FAILED' | 'INFO';
+  error?: string;
+  jobId?: string;
+  payload?: Record<string, unknown>;
+};
+
+export type WorkflowEventInput = {
+  service: ServiceName;
+  eventName: string;
+  processName: string;
+  correlationId: string;
+  eventType: 'local' | 'send' | 'receive';
+  receivedTimestamp?: number;
+  status?: 'SUCCESS' | 'FAILED' | 'INFO';
+  error?: string;
   jobId?: string;
   payload?: Record<string, unknown>;
 };
@@ -33,30 +55,126 @@ export const services: Record<ServiceName, string> = {
 
 export const groqModel = process.env.GROQ_MODEL || 'qwen/qwen3.6-27b';
 
-let logicalClock = 0;
+const processClocks = new Map<string, LamportLogicalClock>();
 const eventHistory: DistributedEvent[] = [];
 const eventListeners = new Set<(event: DistributedEvent) => void>();
+const eventHistoryKey = process.env.DISTRIBUTED_EVENT_HISTORY_KEY || 'dreamcanvas:distributed:event-history';
+let eventRedis: Redis | undefined;
 
-export function recordEvent(input: Omit<DistributedEvent, 'eventId' | 'timestamp' | 'logicalClock'>) {
+function clockFor(processName: string): LamportLogicalClock {
+  let clock = processClocks.get(processName);
+  if (!clock) {
+    clock = new LamportLogicalClock();
+    processClocks.set(processName, clock);
+  }
+  return clock;
+}
+
+function storeEvent(event: DistributedEvent): DistributedEvent {
+  eventHistory.push(event);
+  if (eventHistory.length > 500) eventHistory.shift();
+  eventListeners.forEach((listener) => listener(event));
+  if (process.env.REDIS_URL) {
+    if (!eventRedis || eventRedis.status === 'end') {
+      eventRedis = new Redis(services.redis, {
+        lazyConnect: true,
+        maxRetriesPerRequest: 1,
+        enableOfflineQueue: false,
+        connectTimeout: 1500,
+        retryStrategy: (attempt) => attempt <= 1 ? 100 : null,
+      });
+    }
+    const client = eventRedis;
+    void client.lpush(eventHistoryKey, JSON.stringify(event))
+      .then(() => client.ltrim(eventHistoryKey, 0, 499))
+      .then(() => client.publish('dreamcanvas:events', JSON.stringify(event)))
+      .catch((error: unknown) => {
+        console.error('Could not publish distributed event to Redis:', error instanceof Error ? error.message : error);
+      });
+  }
+  return event;
+}
+
+export function recordWorkflowEvent(input: WorkflowEventInput): DistributedEvent {
+  const clock = clockFor(input.processName);
+  const logicalTimestamp = input.eventType === 'receive'
+    ? input.receivedTimestamp === undefined
+      ? clock.localEvent()
+      : clock.receiveMessage(input.receivedTimestamp)
+    : input.eventType === 'send'
+      ? clock.sendMessage()
+      : clock.localEvent();
+
+  return storeEvent({
+    eventId: randomUUID(),
+    service: input.service,
+    type: input.eventName,
+    timestamp: new Date().toISOString(),
+    logicalClock: logicalTimestamp,
+    logicalTimestamp,
+    processName: input.processName,
+    eventType: input.eventType,
+    correlationId: input.correlationId,
+    status: input.status,
+    error: input.error,
+    jobId: input.jobId,
+    payload: input.payload,
+  });
+}
+
+export function recordPropagatedWorkflowEvent(
+  input: Omit<WorkflowEventInput, 'eventType' | 'receivedTimestamp'> & { logicalTimestamp: number },
+): DistributedEvent {
+  if (!Number.isSafeInteger(input.logicalTimestamp) || input.logicalTimestamp < 0) {
+    throw new RangeError('Propagated Lamport timestamp must be a non-negative safe integer.');
+  }
+  return storeEvent({
+    eventId: randomUUID(),
+    service: input.service,
+    type: input.eventName,
+    timestamp: new Date().toISOString(),
+    logicalClock: input.logicalTimestamp,
+    logicalTimestamp: input.logicalTimestamp,
+    processName: input.processName,
+    eventType: 'send',
+    correlationId: input.correlationId,
+    status: input.status,
+    error: input.error,
+    jobId: input.jobId,
+    payload: input.payload,
+  });
+}
+
+export function recordEvent(input: Omit<DistributedEvent, 'eventId' | 'timestamp' | 'logicalClock' | 'logicalTimestamp' | 'processName' | 'eventType'>) {
+  const processName = input.service;
+  const logicalTimestamp = clockFor(processName).localEvent();
   const event = {
     ...input,
     eventId: randomUUID(),
     timestamp: new Date().toISOString(),
-    logicalClock: ++logicalClock,
+    logicalClock: logicalTimestamp,
+    logicalTimestamp,
+    processName,
+    eventType: 'local' as const,
   } satisfies DistributedEvent;
-  eventHistory.push(event);
-  if (eventHistory.length > 200) eventHistory.shift();
-  eventListeners.forEach((listener) => listener(event));
-  return event;
+  return storeEvent(event);
 }
 
 export function getEvents() {
   return [...eventHistory].reverse();
 }
 
+export function getDistributedEventHistoryKey() {
+  return eventHistoryKey;
+}
+
 export function subscribeToEvents(listener: (event: DistributedEvent) => void) {
   eventListeners.add(listener);
   return () => eventListeners.delete(listener);
+}
+
+export function getProcessLogicalTime(processName: string): number {
+  return clockFor(processName).current();
 }
 
 let redis: Redis | undefined;

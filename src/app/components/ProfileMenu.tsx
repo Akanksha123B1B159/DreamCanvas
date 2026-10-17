@@ -4,7 +4,7 @@ import { useRef, useEffect, useState } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { motion, AnimatePresence } from 'framer-motion';
-import { FaUserCircle, FaMapMarkedAlt, FaChartLine, FaRocket,FaInfoCircle, FaUsers} from 'react-icons/fa';
+import { FaUserCircle, FaMapMarkedAlt, FaChartLine, FaRocket,FaInfoCircle, FaUsers, FaClock} from 'react-icons/fa';
 import BadgeWall from '../components/BadgeWall';
 import { supabase } from '@/app/_libs/supabaseClient';
 
@@ -127,6 +127,22 @@ export default function ProfileMenu({ isLoggedIn, onLogout }: ProfileMenuProps) 
           <FaUsers /> Study Room
         </button>
 
+        <Link
+          href="/system-health"
+          onClick={() => setIsOpen(false)}
+          className="flex items-center gap-2 w-full text-left px-4 py-2 hover:bg-emerald-700 transition"
+        >
+          <span aria-hidden="true">♥</span> System Health
+        </Link>
+
+        <Link
+          href="/distributed-monitor"
+          onClick={() => setIsOpen(false)}
+          className="flex items-center gap-2 w-full text-left px-4 py-2 hover:bg-emerald-700 transition"
+        >
+          <FaClock /> Lamport Clock Monitor
+        </Link>
+
         <div className="h-px bg-gray-700 my-1"></div>
 
         <button
@@ -137,12 +153,28 @@ export default function ProfileMenu({ isLoggedIn, onLogout }: ProfileMenuProps) 
         </button>
       </>
     ) : (
-      <Link
-        href="/login"
-        className="block px-4 py-2 hover:bg-emerald-700 transition"
-      >
-        🔑 Login
-      </Link>
+      <>
+        <Link
+          href="/login"
+          className="block px-4 py-2 hover:bg-emerald-700 transition"
+        >
+          🔑 Login
+        </Link>
+        <Link
+          href="/system-health"
+          onClick={() => setIsOpen(false)}
+          className="block px-4 py-2 hover:bg-emerald-700 transition"
+        >
+          ♥ System Health
+        </Link>
+        <Link
+          href="/distributed-monitor"
+          onClick={() => setIsOpen(false)}
+          className="block px-4 py-2 hover:bg-emerald-700 transition"
+        >
+          Lamport Clock Monitor
+        </Link>
+      </>
     )}
 
           </motion.div>

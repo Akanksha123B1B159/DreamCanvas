@@ -3,7 +3,7 @@
 import { useState } from 'react';
 import { useRouter } from 'next/navigation';
 import Swal from 'sweetalert2';
-import { isSupabaseConfigured, supabase } from '@/app/_libs/supabaseClient';
+import { supabase } from '@/app/_libs/supabaseClient';
 import { motion } from 'framer-motion';
 import { Mail, Lock, Sparkles, ArrowRight, LogIn } from 'lucide-react';
 
@@ -16,11 +16,15 @@ export default function LoginPage() {
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
 
-    if (!isSupabaseConfigured) {
+    if (loading) return;
+
+    const normalizedEmail = email.trim().toLowerCase();
+
+    if (!normalizedEmail || !password) {
       Swal.fire({
-        icon: 'error',
-        title: 'Configuration required',
-        text: 'Supabase is not configured. Set NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_ANON_KEY in the project .env file, then restart the app.',
+        icon: 'warning',
+        title: 'Missing details',
+        text: 'Please enter your email and password.',
         position: 'top',
       });
       return;
@@ -29,58 +33,69 @@ export default function LoginPage() {
     setLoading(true);
 
     try {
-      const { data, error } = await supabase.auth.signInWithPassword({
-        email,
+      const { error } = await supabase.auth.signInWithPassword({
+        email: normalizedEmail,
         password,
       });
 
       if (error) {
-        setLoading(false);
-        console.error('Login error:', error.message);
         Swal.fire({
           icon: 'error',
-          title: 'Oops...',
-          text: error.message || 'Login failed',
+          title: 'Sign-in unsuccessful',
+          text: 'Unable to sign in. Check your credentials or try again later.',
           position: 'top',
         });
         return;
       }
 
-      const user = data.user;
-      if (!user) {
-        setLoading(false);
+      const {
+        data: { user },
+        error: userError,
+      } = await supabase.auth.getUser();
+
+      if (userError || !user) {
         Swal.fire({
           icon: 'error',
-          title: 'Oops...',
-          text: 'Supabase authenticated the request but returned no user. Please try again.',
+          title: 'Session verification failed',
+          text: 'Unable to verify your session. Please try signing in again.',
           position: 'top',
         });
         return;
       }
 
-      const { data: roadmapData } = await supabase
-        .from('roadmap')
-        .select('id')
-        .eq('user_id', user.id)
-        .limit(1)
-        .maybeSingle();
+      const { data: roadmapData, error: roadmapError } =
+        await supabase
+          .from('roadmap')
+          .select('id')
+          .eq('user_id', user.id)
+          .limit(1)
+          .maybeSingle();
 
-      setLoading(false);
+      if (roadmapError) {
+        console.error('Could not retrieve roadmap status.');
+        Swal.fire({
+          icon: 'error',
+          title: 'Unable to load your dashboard',
+          text: 'You are signed in, but your dashboard could not be loaded. Please try again.',
+          position: 'top',
+        });
+        return;
+      }
 
       if (roadmapData) {
         router.push('/calender');
       } else {
         router.push('/analyze');
       }
-    } catch (err) {
-      console.error('Unexpected login error:', err);
-      setLoading(false);
+    } catch {
       Swal.fire({
         icon: 'error',
-        title: 'Oops...',
-        text: 'Something went wrong, please try again.',
+        title: 'Something went wrong',
+        text: 'Please try again later.',
         position: 'top',
       });
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -145,6 +160,7 @@ export default function LoginPage() {
                   value={email}
                   onChange={(e) => setEmail(e.target.value)}
                   required
+                  disabled={loading}
                   placeholder="you@example.com"
                   className="w-full pl-12 pr-4 py-3.5 bg-slate-900/80 border border-slate-700 rounded-xl text-white placeholder-slate-500 focus:outline-none focus:border-emerald-500/50 focus:ring-2 focus:ring-emerald-500/20 transition-all duration-200"
                 />
@@ -170,6 +186,7 @@ export default function LoginPage() {
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
                   required
+                  disabled={loading}
                   placeholder="••••••••"
                   className="w-full pl-12 pr-4 py-3.5 bg-slate-900/80 border border-slate-700 rounded-xl text-white placeholder-slate-500 focus:outline-none focus:border-emerald-500/50 focus:ring-2 focus:ring-emerald-500/20 transition-all duration-200"
                 />

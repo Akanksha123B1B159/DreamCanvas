@@ -2,10 +2,13 @@
 
 import { useEffect, useState, useCallback } from 'react';
 import { useRouter } from 'next/navigation';
+import Link from 'next/link';
 import { supabase } from '@/app/_libs/supabaseClient';
 import DownloadPDFButton from '@/app/components/DownloadPDFButton';
 import { motion } from 'framer-motion';
 import { FaRegCalendarCheck } from 'react-icons/fa';
+import { browserLamportClock } from '@/services/synchronization/lamportLogicalClock';
+import { reportRoadmapWorkflowEvent } from '@/services/synchronization/roadmapWorkflowEvents';
 
 interface DayPlan {
   day: number;
@@ -19,11 +22,12 @@ export default function RoadmapPage() {
   const [role, setRole] = useState('');
   const [loading, setLoading] = useState(true);
   const [hasSaved, setHasSaved] = useState(false);
+  const [correlationId, setCorrelationId] = useState('');
 
   const router = useRouter();
 
   // Function to save the target role to the users table
-  const saveTargetRoleToUsers = async (userId: string, role: string) => {
+  const saveTargetRoleToUsers = useCallback(async (userId: string, role: string) => {
     const { error } = await supabase
       .from('users')
       .update({ target: role })
@@ -34,19 +38,36 @@ export default function RoadmapPage() {
     } else {
       console.log('✅ User target role updated successfully');
     }
-  };
+  }, []);
 
   // Function to save the roadmap to Supabase
   const saveRoadmapToSupabase = useCallback(
     async (roadmapToSave: DayPlan[], targetRole: string) => {
+      const correlationId = localStorage.getItem('roadmapCorrelationId') || crypto.randomUUID();
+      localStorage.setItem('roadmapCorrelationId', correlationId);
+      const previousTimestamp = Number(localStorage.getItem('roadmapLamportTimestamp'));
+      if (Number.isSafeInteger(previousTimestamp) && previousTimestamp >= 0) {
+        browserLamportClock.receiveMessage(previousTimestamp);
+      }
+
+      const reportFailure = async (message: string) => {
+        try {
+          await reportRoadmapWorkflowEvent(correlationId, 'LEARNING_PLAN_FAILED', message);
+        } catch (eventError) {
+          console.error('❌ Failed to record roadmap save failure:', eventError);
+        }
+      };
+
       const {
         data: { user },
         error: userError,
       } = await supabase.auth.getUser();
 
       if (userError || !user) {
-        console.error("❌ Failed to get user:", userError?.message || "User not logged in");
-        return;
+        const message = userError?.message || 'User not logged in';
+        console.error('❌ Failed to get user:', message);
+        await reportFailure(message);
+        return false;
       }
 
       console.log("✅ User ID:", user.id);
@@ -68,16 +89,27 @@ export default function RoadmapPage() {
 
       if (error) {
         console.error("❌ Upsert error:", error.message);
+        await reportFailure(error.message);
+        return false;
       } else {
         console.log("🎉 Roadmap saved (upserted) successfully");
+        try {
+          await reportRoadmapWorkflowEvent(correlationId, 'LEARNING_PLAN_SAVED');
+        } catch (eventError) {
+          console.error('❌ Roadmap saved, but its distributed event could not be recorded:', eventError);
+        }
+        localStorage.setItem('hasSavedRoadmap', 'true');
+        return true;
       }
     },
-    [supabase, saveTargetRoleToUsers] // ✅ added missing dependency
+    [saveTargetRoleToUsers]
   );
 
   // useEffect hook to check authentication and load roadmap data
   useEffect(() => {
     const checkAuthAndLoad = async () => {
+      const storedCorrelationId = localStorage.getItem('roadmapCorrelationId') || '';
+      setCorrelationId(storedCorrelationId);
       const {
         data: { user },
       } = await supabase.auth.getUser();
@@ -111,24 +143,25 @@ export default function RoadmapPage() {
         console.error('❌ Failed to fetch roadmap:', roadmapError.message);
       }
 
-      if (existingRoadmap && existingRoadmap.length > 0) {
+      const stored = localStorage.getItem('roadmap');
+      const parsed = stored ? JSON.parse(stored) : null;
+      const hasPendingGeneratedPlan = Boolean(localStorage.getItem('roadmapCorrelationId'))
+        && localStorage.getItem('hasSavedRoadmap') !== 'true';
+
+      if (existingRoadmap && existingRoadmap.length > 0 && !hasPendingGeneratedPlan) {
         // Roadmap found → use it
         setRoadmap(existingRoadmap as DayPlan[]);
         console.log('📥 Loaded existing roadmap from Supabase');
-      } else {
+      } else if (parsed) {
         // Roadmap not found → fallback to localStorage
-        const stored = localStorage.getItem('roadmap');
         const localTarget = localStorage.getItem('targetRole');
-        const parsed = stored ? JSON.parse(stored) : null;
         const target = userRole || localTarget || '';
-
-        if (parsed) {
-          setRoadmap(parsed);
-          await saveRoadmapToSupabase(parsed, target);
-          localStorage.setItem('hasSavedRoadmap', 'true');
-          setHasSaved(true);
-          console.log('📤 Saved roadmap from localStorage to Supabase');
-        }
+        setRoadmap(parsed);
+        const saved = await saveRoadmapToSupabase(parsed, target);
+        setHasSaved(saved);
+        if (saved) console.log('📤 Saved roadmap from localStorage to Supabase');
+      } else if (existingRoadmap && existingRoadmap.length > 0) {
+        setRoadmap(existingRoadmap as DayPlan[]);
       }
 
       // Step 3: Load skills
@@ -145,7 +178,7 @@ export default function RoadmapPage() {
     };
 
     checkAuthAndLoad();
-  }, [router, supabase, saveRoadmapToSupabase]); // ✅ don't include hasSaved
+  }, [router, saveRoadmapToSupabase]); // ✅ don't include hasSaved
 
   if (loading) return <div className="text-white p-6">Loading your roadmap...</div>;
 
@@ -154,6 +187,18 @@ export default function RoadmapPage() {
       <h1 className="text-3xl font-bold mb-4 text-emerald-400 animate-fade-in-up">
         Your Roadmap to Become a {role}
       </h1>
+
+      {correlationId && (
+        <div className="mb-5 flex flex-col gap-2 rounded-xl border border-cyan-500/20 bg-cyan-950/20 p-4 sm:flex-row sm:items-center sm:justify-between">
+          <div className="min-w-0">
+            <p className="text-xs font-semibold uppercase tracking-wider text-cyan-300">Request / correlation ID</p>
+            <code className="mt-1 block break-all text-xs text-slate-300">{correlationId}</code>
+          </div>
+          <Link href={`/distributed-monitor?requestId=${encodeURIComponent(correlationId)}`} className="shrink-0 text-sm font-semibold text-cyan-300 hover:text-cyan-200 hover:underline">
+            View Lamport timeline →
+          </Link>
+        </div>
+      )}
 
       {/* display the missing skills */}
       <p className="mb-6 text-lg text-gray-300 animate-fade-in-up delay-100">

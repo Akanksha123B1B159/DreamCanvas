@@ -6,6 +6,11 @@ import { supabase } from '@/app/_libs/supabaseClient';
 import Loader from '@/app/components/Loader';
 import RoleSelector from '@/app/components/RoleSelector';
 import '@/app/components/inputfield.css';
+import { browserLamportClock } from '@/services/synchronization/lamportLogicalClock';
+import {
+  persistRoadmapWorkflowEvents,
+  reportRoadmapWorkflowEvent,
+} from '@/services/synchronization/roadmapWorkflowEvents';
 
 export default function AnalyzePage() {
   const router = useRouter();
@@ -53,33 +58,54 @@ export default function AnalyzePage() {
     if (!skills || !role) return alert("Please fill in all fields");
 
     setLoading(true);
+    const correlationId = crypto.randomUUID();
+    const requestTimestamp = browserLamportClock.sendMessage();
+    let responseReceived = false;
     try {
-      // Call the API endpoint to analyze the user's skills and role
       const res = await fetch('/api/generate-roadmap', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'x-correlation-id': correlationId,
+          'x-lamport-timestamp': String(requestTimestamp),
+          'x-lamport-process': 'dreamcanvas-browser',
+          'x-lamport-event': 'LEARNING_PLAN_REQUESTED',
+        },
         body: JSON.stringify({ skills, role }),
       });
+      responseReceived = true;
+      const responseTimestamp = Number(res.headers.get('x-lamport-timestamp'));
+      if (Number.isSafeInteger(responseTimestamp) && responseTimestamp >= 0) {
+        browserLamportClock.receiveMessage(responseTimestamp);
+      }
       const data = await res.json();
-      if (data.error) throw new Error(data.error);
+      persistRoadmapWorkflowEvents(data.events);
+      if (!res.ok || data.error) throw new Error(data.error || 'Roadmap generation failed.');
       if (!data.roadmap) throw new Error('Invalid response.');
 
       localStorage.setItem('roadmap', JSON.stringify(data.roadmap));
       localStorage.setItem('missingSkills', JSON.stringify(data.missingSkills));
       localStorage.setItem('targetRole', role);
+      localStorage.setItem('roadmapCorrelationId', correlationId);
+      localStorage.setItem('roadmapLamportTimestamp', String(data.logicalTimestamp ?? requestTimestamp));
       localStorage.removeItem('hasSavedRoadmap'); // ✅ Force re-saving in roadmap page
-
 
       router.push('/roadmap');
     } catch (err: unknown) {
-  console.error("Roadmap error:", err);
-
-  if (err instanceof Error) {
-    alert(err.message);
-  } else {
-    alert("Error generating roadmap");
-  }
-} finally {
+      console.error('Roadmap error:', err);
+      if (!responseReceived) {
+        try {
+          await reportRoadmapWorkflowEvent(
+            correlationId,
+            'LEARNING_PLAN_FAILED',
+            err instanceof Error ? err.message : 'Roadmap request could not reach the API.',
+          );
+        } catch (eventError) {
+          console.error('Failed to record roadmap request failure:', eventError);
+        }
+      }
+      alert(err instanceof Error ? err.message : 'Error generating roadmap');
+    } finally {
       setLoading(false);
     }
   };
@@ -88,25 +114,68 @@ export default function AnalyzePage() {
     if (!skills || !role) return alert('Please fill in all fields');
     setQueued(true);
     setQueueStatus('Roadmap request received');
+    const correlationId = crypto.randomUUID();
+    const requestTimestamp = browserLamportClock.sendMessage();
+    let responseReceived = false;
     try {
-      const response = await fetch('/api/roadmap-jobs', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ skills, role }) });
+      const response = await fetch('/api/roadmap-jobs', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-correlation-id': correlationId,
+          'x-lamport-timestamp': String(requestTimestamp),
+          'x-lamport-process': 'dreamcanvas-browser',
+          'x-lamport-event': 'LEARNING_PLAN_REQUESTED',
+        },
+        body: JSON.stringify({ skills, role }),
+      });
+      responseReceived = true;
+      const responseTimestamp = Number(response.headers.get('x-lamport-timestamp'));
+      if (Number.isSafeInteger(responseTimestamp) && responseTimestamp >= 0) {
+        browserLamportClock.receiveMessage(responseTimestamp);
+      }
       const job = await response.json();
+      persistRoadmapWorkflowEvents(job.events);
       if (!response.ok) throw new Error(job.error || 'Could not create queued job');
       const started = Date.now();
       let status = job;
       while (status.status !== 'COMPLETED' && status.status !== 'FAILED' && Date.now() - started < 120000) {
         setQueueStatus(status.status === 'RUNNING' ? 'Generating roadmap' : 'Waiting for worker');
         await new Promise((resolve) => setTimeout(resolve, 1000));
-        status = await (await fetch(`/api/roadmap-jobs?jobId=${job.jobId}`)).json();
+        const statusResponse = await fetch(`/api/roadmap-jobs?jobId=${job.jobId}`);
+        const statusTimestamp = Number(statusResponse.headers.get('x-lamport-timestamp'));
+        if (Number.isSafeInteger(statusTimestamp) && statusTimestamp >= 0) {
+          browserLamportClock.receiveMessage(statusTimestamp);
+        }
+        if (!statusResponse.ok) throw new Error('Could not retrieve queued roadmap status.');
+        status = await statusResponse.json();
       }
       if (status.status !== 'COMPLETED') throw new Error(status.error || 'Queued roadmap did not complete');
       const result = status.result;
       localStorage.setItem('roadmap', JSON.stringify(result.roadmap));
       localStorage.setItem('missingSkills', JSON.stringify(result.missingSkills));
       localStorage.setItem('targetRole', role);
+      localStorage.setItem('roadmapCorrelationId', job.correlationId || correlationId);
+      localStorage.setItem('roadmapLamportTimestamp', String(status.logicalTimestamp ?? job.logicalTimestamp ?? requestTimestamp));
+      localStorage.removeItem('hasSavedRoadmap');
       setQueueStatus('Roadmap completed');
       router.push('/roadmap');
-    } catch (error) { alert(error instanceof Error ? error.message : 'Queued roadmap failed'); } finally { setQueued(false); }
+    } catch (error) {
+      if (!responseReceived) {
+        try {
+          await reportRoadmapWorkflowEvent(
+            correlationId,
+            'LEARNING_PLAN_FAILED',
+            error instanceof Error ? error.message : 'Queued roadmap request could not reach the API.',
+          );
+        } catch (eventError) {
+          console.error('Failed to record queued roadmap failure:', eventError);
+        }
+      }
+      alert(error instanceof Error ? error.message : 'Queued roadmap failed');
+    } finally {
+      setQueued(false);
+    }
   };
 
   if (checkingAuth) {
@@ -154,6 +223,17 @@ export default function AnalyzePage() {
           <RoleSelector value={role} onChange={setRole} />
 
           {role && <p className="text-sm text-gray-400">Selected Role: <strong className="text-emerald-400">{role}</strong></p>}
+
+          <button
+            type="button"
+            onClick={() => {
+              setSkills('Linux, Docker, Git, basic networking, and introductory cloud knowledge');
+              setRole('DevOps Engineer');
+            }}
+            className="text-sm text-cyan-300 hover:text-cyan-200 hover:underline"
+          >
+            Load DevOps Engineer Lamport-clock demo
+          </button>
 
           <button
             type="submit"
